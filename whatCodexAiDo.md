@@ -170,3 +170,104 @@ VNTimeline(chapter01_shot12)
 ## 12. 下一步建议
 
 先不要继续堆独立特效组件。下一项开发应是“阶段 1 最小纵向切片”：只选一段 10–20 句、2 个角色、2 个背景、1 次表情变化、1 次镜头移动和 1 个二选一分支。它会验证 Dialogue System 与现有 VNEffects 的边界，并为后续所有内容建立可复制模板。
+
+## 13. 进一步技术规格与制作决策（2026-07-13）
+
+### 插件与依赖确认
+
+- 当前 Dialogue System for Unity 版本为 `2.2.73`。
+- 插件自带 `SequencerCommandTemplate`，支持读取参数、等待异步演出、结束时 `Stop()`，并要求在取消时通过 `OnDestroy()` 清理状态。这正适合作为 `VNDirector` 的桥接入口。
+- Unity Timeline `1.8.9` 已安装，可以承载复杂分镜。
+- 当前未安装 Cinemachine。第一版继续使用现有 `VNCamera`；只有出现多虚拟机位混合、目标跟随、轨道镜头等明确需求时再引入 Cinemachine，避免同时维护两套镜头系统。
+
+### 时间与并发语义
+
+所有演出必须明确属于以下一种：
+
+1. **立即命令**：设置表情、切换说话人高亮等，当帧完成。
+2. **阻塞命令**：必须等转场、角色入场或镜头运动结束才显示下一句。
+3. **非阻塞命令**：雨、呼吸、背景缓慢推镜等持续播放，台词可以继续。
+4. **并行组**：例如背景淡出、立绘入场、镜头推进同时开始，并等待组内指定的最长动作。
+5. **持久状态**：背景、角色槽位、天气、色调；读档时直接恢复最终状态，不重播入场动画。
+
+每类资源通道只能有一个所有者：Camera 通道由 `VNCameraDirector` 写入，Character/Yuki 通道由对应 `VNCharacterView` 写入，Weather 通道由 `VNEffectDirector` 写入。新命令进入同一通道时采用明确策略：`Replace`、`Queue` 或 `Ignore`，不可让多个 DOTween 静默争写同一属性。
+
+### 推荐的场景层级
+
+```text
+VNRoot
+├─ BackgroundRoot（背景 A/B 双缓冲交叉淡化）
+├─ StageRoot
+│  ├─ SlotFarLeft
+│  ├─ SlotLeft
+│  ├─ SlotCenter
+│  ├─ SlotRight
+│  └─ SlotFarRight
+├─ WeatherRoot（非 UI 世界/屏幕特效）
+├─ CameraRig（现有 ZoomRoot/TiltRoot/SceneRoot）
+├─ OverlayRoot（闪白、转场、色调、Vignette）
+└─ DialogueCanvas（姓名、台词、历史、选项、系统菜单）
+```
+
+背景使用 A/B 双层而不是销毁再创建，以便稳定交叉淡化。角色槽位固定，但角色实例与槽位分离；同一角色可换位，槽位只表达构图。选项 UI 独立于普通台词 UI，并由 Dialogue System 的响应列表驱动，禁止再维护第二套分支数据。
+
+### 对话节点的最小数据约定
+
+每个 Dialogue Entry 只保存叙事事实与少量演出引用：
+
+- `Actor` / `Conversant`：说话人与对象。
+- `Dialogue Text`：台词正文。
+- `Conditions`：出现条件。
+- `User Script`：变量更新、好感度和剧情旗标。
+- `Sequence`：调用命名演出命令或 Timeline。
+- 自定义字段：`ShotId`、`VoiceId`、`Notes`、`LocalizationKey`，不要把任意 JSON 全塞进字段。
+
+推荐一条剧情节点最多包含 1–3 个高层演出意图。若命令字符串超过一行、参数超过约 5 个或包含复杂重叠时间轴，则引用 `ShotPreset` 或 Timeline，而不是继续堆字符串。
+
+### 常见做法与最佳实践的区别
+
+常见做法是直接在每句台词的 Sequence 中写 `Camera()`、`MoveTo()`、`AnimatorPlayWait()` 等底层命令；小项目可行，但资源改名、批量调节节奏和读档恢复会越来越困难。最佳实践是剧情节点引用高层语义，例如 `VNShot(confession_closeup)`，实际镜头距离、入场曲线和时长在预设资产中维护。
+
+常见做法是用角色名查找 GameObject；最佳实践是稳定 ID + Catalog + 运行时注册表。常见做法是每条台词保存完整画面；最佳实践是保存“状态差量”，同时让系统能计算任意节点的完整快照用于预览和读档。常见做法是把所有东西做成 Timeline；最佳实践是普通台词走数据驱动命令，只有精确分镜走 Timeline，否则数百条 Timeline 会比对话数据库更难维护。
+
+### 制作工具优先级
+
+第一优先不是做完整节点编辑器，而是以下四个小工具：
+
+1. `VN Catalog Window`：管理角色、表情、背景、镜头和效果 ID。
+2. `Sequence Command Builder`：用下拉菜单生成合法命令，不手输 ID。
+3. `VN Validator`：扫描缺图、无效 ID、不可达分支和重复变量。
+4. `Preview From Entry`：从指定 Dialogue Entry 构建快照并播放该句演出。
+
+等纵向切片稳定后，再考虑统一的“分镜表”编辑器、表格同步和波形/配音对齐。编辑器工具必须调用与运行时相同的命令与 Catalog，不能复制一套预览逻辑。
+
+### 第一版明确不做
+
+- 不从零重写分支图编辑器、Lua/条件系统或存档系统。
+- 不同时引入 Ink、Yarn、Naninovel 等第二套叙事框架。
+- 不立即安装 Cinemachine。
+- 不先支持无限角色槽位、任意嵌套并行语法或复杂回滚。
+- 不一次性封装全部 31 个 VNEffects；先接入背景、角色、表情、镜头、天气、转场与选项七条关键路径。
+
+### 最小纵向切片验收脚本
+
+制作一个约 60–90 秒样例：教室日景淡入；Yuki 从左侧进入 Center；表情由 neutral 切换为 smile；镜头缓慢推进并停顿 0.4 秒；天气从无切换为轻雨；另一角色从 Right 进入；出现两个有条件的选项；两个分支分别改变变量并进入不同背景；存档后重新加载应直接恢复背景、两名角色、表情、槽位、天气和镜头终态。这个样例通过后，架构才允许扩展到更多特效和批量内容生产。
+
+## 14. VN 通用系统第一版实现记录（2026-07-13）
+
+本轮在保留分支 `agent/vn-foundation` 上实现以下内容：
+
+- `VNContentCatalog`：集中管理角色、表情、背景、镜头和天气预设，使用忽略大小写的稳定 ID 查询。
+- `VNStageController`：背景 A/B 双缓冲交叉淡化、五个构图槽位和五实例角色池。
+- `VNCharacterView`：立绘显示、表情切换、移动、隐藏；若配置 `VNEntranceAnimator` 则复用高级演出，否则自动降级为基础淡入/滑动。
+- `VNDirector`：统一提供背景、角色、表情、移动、镜头、天气、通用特效和等待 API，并支持 `instant` 模式。
+- `VNEffectDirector`：用 Inspector 的 UnityEvent binding 接入现有心跳、景深、震动等组件，不让剧情代码依赖具体实现。
+- `VNStateSnapshot`：JSON 化保存和恢复背景、角色、表情、槽位、镜头、天气与持续特效。
+- Dialogue System 命令：`VNBG`、`VNChar`、`VNFace`、`VNMove`、`VNHide`、`VNCamera`、`VNWeather`、`VNEffect`、`VNWait`；命令会等待 DOTween 完成，并在取消时清理。
+- 编辑器工具：一键创建 VN Runtime Rig、自动补 Dialogue Manager、Catalog 校验、Sequence Command Builder。
+- 默认资产：`Assets/VNSystem/Data/VNContentCatalog.asset`，预置基础镜头和五种天气 ID。
+- 使用文档：`Assets/Scripts/VNSystem/README.md`。
+
+验证结果：项目当时已在两个 Unity Editor 进程中打开，Unity BatchMode 因工程锁无法启动，未擅自关闭用户编辑器。改用 `Temp/CodexValidation` 中不进入版本控制的一次性项目，分别按 Unity 程序集边界编译运行时和 Editor 代码；两者最终均为 **0 warnings / 0 errors**。同时修正 Unity 6 已弃用的 `FindObjectOfType`、命令生成器区域小数格式，以及角色入场同帧查找问题。
+
+当前边界：系统代码与默认配置已完成，但没有擅自修改用户正在编辑的场景，也没有虚构角色/背景资源映射或剧情。下一步在 Unity 中执行 `Tools > VN System > Create or Repair Runtime Rig`，为 Catalog 指定真实 Sprite，并制作最小纵向切片 Conversation。
