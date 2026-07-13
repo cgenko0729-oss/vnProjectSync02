@@ -1,0 +1,618 @@
+# WhatAiDo.md — 视觉小说 2D 图片特效系统 开发全记录
+
+> 由 Claude (AI) 编写，记录本次开发的完整思路、计划、每一步做了什么、每个文件的作用与使用方法。
+> 日期：2026-07-12
+
+---
+
+## 一、需求分析
+
+**目标**：让视觉小说不只是"干巴巴地展示图片"，而是让 2D 图片（背景、立绘）通过程序化特效变得
+**好看、丰富、明亮**。具体包括：
+
+1. **屏幕悬浮粒子** —— 尘埃、星光在画面上缓慢漂浮、一闪一闪，润色整个画面氛围
+2. **光晕/发光效果** —— 图片带柔和辉光、呼吸般脉动，看起来"亮起来"
+3. **绚丽的出场效果** —— 图片登场时有溶解显形、扫光、爆闪、弹出等华丽演出
+4. **常驻的"活图"效果** —— 图片显示期间也不死板：呼吸发光、悬浮飘动、周期扫光
+
+## 二、项目环境勘察（动手前先确认的事实）
+
+| 项目 | 结论 |
+|---|---|
+| Unity 版本 | 6000.0.62f1 (Unity 6) |
+| 渲染管线 | **URP 17**（`com.unity.render-pipelines.universal` 17.0.4），有 PC / Mobile 两套 RP 资产 |
+| 动画库 | **DOTween** 已安装在 `Assets/Plugins/Demigiant`（已验证 `Material.DOFloat(int propertyID)`、`CanvasGroup.DOFade` 等 API 存在） |
+| 输入系统 | `activeInputHandler = 1` → **仅新版 Input System**，演示脚本必须用 `Keyboard.current` 而不能用旧版 `Input.GetKeyDown` |
+| 现有素材 | `Assets/Assets` 下两张 AI 生成的动漫图（一张 solo 立绘、一张双人场景图），正好用作演示的立绘与背景 |
+| 项目状态 | 基本为空项目（只有模板文件），可以从零搭建 |
+
+这些勘察决定了几个**关键技术决策**：
+
+- **发光要"真的亮"必须靠 URP Bloom 后处理 + HDR 颜色**（shader 中输出 >1 的颜色分量，Bloom 阈值设为 1.0，超过 1 的部分才泛光）。因此需要自动配置 Volume + Bloom。
+- **uGUI 的顶点色是 Color32，会被钳制到 1**，所以 HDR 发光颜色必须通过**材质属性**传入 shader，不能靠 `Image.color`。
+- **Canvas 必须用 Screen Space - Camera 模式**，否则 Overlay 模式的 UI 永远盖在世界空间粒子之上，粒子无法与画面混排。用 `sortingOrder` 控制粒子与 Canvas 的前后关系。
+- **全部贴图程序化生成**（柔光圆、四芒星、径向光晕），溶解噪声直接在 shader 里算分形值噪声——整套系统**零美术资源依赖**。
+- uGUI 自定义 shader 在 URP 下仍走传统 CGPROGRAM 路径（Canvas 渲染不经过 URP 光照），所以按 `UI/Default` 的骨架写，保留 Stencil / RectMask2D 裁剪兼容。
+
+## 三、系统架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     四层特效架构                          │
+├─────────────────────────────────────────────────────────┤
+│ 第 4 层  后处理：URP Bloom + Vignette（让 HDR 真正泛光）    │
+│ 第 3 层  演出编排：VNEntranceAnimator（DOTween 序列）       │
+│ 第 2 层  粒子氛围：VNAmbientParticles + 星光爆发            │
+│ 第 1 层  像素级特效：VN/ImageEffect Shader（溶解/扫光/发光） │
+└─────────────────────────────────────────────────────────┘
+```
+
+## 四、创建的文件清单与详细说明
+
+### 1. `Assets/Shaders/VNImageEffect.shader` — 图片特效主 Shader
+
+挂在 uGUI Image/RawImage 上的核心 shader，一个 Pass 内叠加 6 种效果（按片元执行顺序）：
+
+| 效果 | 属性 | 说明 |
+|---|---|---|
+| 微波浪扭曲 | `_WaveAmount/_WaveSpeed/_WaveFreq` | UV 正弦偏移，给图片轻微"微风飘动"感，默认关闭 |
+| HSV 调色 | `_HueShift/_Saturation/_Brightness` | 色相偏移、饱和度、亮度（可做夜晚变暗、回忆降饱和、彩虹演示） |
+| 斜向扫光 | `_ShineProgress/_ShineWidth/_ShineAngle/_ShineColor`(HDR) | 一道高光带沿指定角度扫过图片；Progress 从 -0.3 推到 1.3 完成一次扫光 |
+| HDR 自发光 | `_EmissionColor`(HDR)`/_EmissionAmount` | 全图叠加发光色，配合 Bloom 产生"呼吸辉光" |
+| 噪声溶解 | `_DissolveAmount/_DissolveScale/_DissolveEdgeWidth/_DissolveEdgeColor`(HDR) | 0=完全隐藏，1=完全显示；溶解边界带 HDR 辉光边缘（出场像"从光中凝聚成形"） |
+| 闪白 | `_FlashAmount/_FlashColor` | 整图向纯色插值，用于出场瞬间爆闪 |
+
+技术要点：
+- **噪声不用贴图**：shader 内置 `hash21 → 值噪声 → 3 层 fbm 分形叠加`，输出范围约 0~0.96，
+  溶解阈值用 `lerp(1.02, -0.02, amount)` 映射保证两端完全显示/完全隐藏。
+- 完整保留 uGUI 的 `UNITY_UI_CLIP_RECT` / `UNITY_UI_ALPHACLIP` 与 Stencil 属性，不破坏 Mask 功能。
+- HDR 属性用 `[HDR]` 标记，Inspector 里可直接调发光强度。
+
+### 2. `Assets/Shaders/VNAdditive.shader` — 加法混合发光 Shader
+
+`Blend SrcAlpha One` 加法混合（只增亮不遮挡），带 `[HDR] _TintColor`。两个用途共用：
+粒子系统的材质（顶点色 = 粒子颜色）、图片背后光环的 RawImage 材质。HDR 颜色 >1 时被 Bloom 拾取泛光。
+
+### 3. `Assets/Scripts/VNEffects/VNProceduralTextures.cs` — 程序化贴图生成器
+
+运行时生成三张贴图（懒加载 + 缓存，零美术资源）：
+- `SoftCircle`（64px 柔边圆）→ 尘埃、光斑粒子
+- `Sparkle`（64px 四芒星：中心亮核 + 横竖两道细长星芒，`pow(1-d, 24)` 收窄）→ 星光粒子
+- `RadialGlow`（256px 径向渐变）→ 图片背后光环
+
+### 4. `Assets/Scripts/VNEffects/VNImageEffectController.cs` — 单图特效控制器
+
+挂在 Image/RawImage 上，**每张图自动持有独立材质实例**（互不干扰，OnDestroy 自动清理）。API：
+
+```csharp
+var fx = image.GetComponent<VNImageEffectController>();
+fx.SetDissolve(0.5f);                        // 立即设置溶解度
+fx.DODissolve(1f, 1.2f);                     // 补间溶解（出场）
+fx.PlayShine(0.75f);                         // 播一次扫光
+fx.StartShineLoop(5f);                       // 每 5 秒自动扫光一次
+fx.StartBreathingGlow(color, 0.25f, 3f);     // 呼吸发光（HDR + Bloom = 柔和辉光脉动）
+fx.PulseEmission(color, 0.8f);               // 瞬时发光脉冲（高亮说话者）
+fx.DOFlash(1f, 0.35f);                       // 闪白一次
+fx.SetHSV(hue, sat, bri);                    // 调色
+fx.DOBrightness(0.6f, 1f);                   // 渐变变暗（如夜晚）
+fx.StartFloating(8f, 4f);                    // 上下悬浮飘动
+fx.SetWave(0.005f);                          // 微波浪
+fx.StopAllLoops();                           // 停止全部常驻效果
+```
+
+所有 Tween 都 `SetLink(gameObject)`，物体销毁时自动回收，不会泄漏。
+
+### 5. `Assets/Scripts/VNEffects/VNGlowBackdrop.cs` — 背后柔光光环
+
+挂在立绘上，自动在其**背后**（同父级、前一个渲染顺序）生成一个径向光晕 RawImage：
+- 常态：呼吸脉动（`pulsePeriod` / `pulseStrength` 可调）
+- `Flare()`：出场瞬间光环从小到大闪耀一次再回落到呼吸状态
+- 颜色 × `hdrIntensity`(默认1.6) 触发 Bloom，立绘像被一圈柔光包裹
+
+### 6. `Assets/Scripts/VNEffects/VNEntranceAnimator.cs` — 出场/退场演出编排器
+
+把 shader 参数、CanvasGroup 透明度、RectTransform 位移缩放、背后光环、星光爆发粒子
+编排成完整的 DOTween Sequence。**五种出场预设**：
+
+| 预设 | 演出内容 | 适用场景 |
+|---|---|---|
+| `DissolveGlow` | 噪声溶解显形 + 辉光边缘 + 光环闪耀 + 星光爆发 + 收尾微闪 | 立绘首次登场（最华丽） |
+| `FadeSlideUp` | 从下方 45px 轻盈滑入 + 淡入 + 光环渐亮 | 日常对话切换 |
+| `ScaleBounce` | 0.65→1 弹性弹出(OutBack) + 微闪白 + 星光 | 俏皮/惊喜登场 |
+| `ShineReveal` | 淡入后一道扫光掠过 | 优雅登场 |
+| `FlashBloom` | 全屏爆闪中显形 + 光环大闪耀 + 白色星光 + 扫光收尾 | 高潮/重要角色 |
+
+退场：`PlayExitDissolve()`（化作光点消散）、`PlayExitFade()`（淡出下滑）。
+出场完成后调 `StartIdleEffects()` 一键开启常驻"活图"三件套（呼吸发光+悬浮+周期扫光）。
+
+```csharp
+// 典型用法：
+animator.PlayEntrance(VNEntrancePreset.DissolveGlow)
+        .OnComplete(() => animator.StartIdleEffects());
+```
+
+### 7. `Assets/Scripts/VNEffects/VNAmbientParticles.cs` — 悬浮氛围粒子
+
+挂在空物体上，Awake 时**全代码配置** ParticleSystem（发射区自动匹配相机可见范围）。三种预设：
+
+| 预设 | 效果 | 参数特征 |
+|---|---|---|
+| `Dust` | 细小尘埃缓慢上飘 | 0.015~0.05 尺寸，噪声扰动，低透明度 |
+| `Sparkles` | 四芒星**一闪一闪** | 尺寸随生命周期多峰起伏（TwinkleCurve）+ 缓慢旋转 |
+| `Orbs` | 大颗柔光光斑（散景感） | 0.25~0.7 尺寸，极低透明度，超慢漂移 |
+
+所有粒子颜色 × `hdrBoost`(默认1.8) → 被 Bloom 泛光，星光真的"发亮"。
+`sortingOrder` 需高于 Canvas 的 sortingOrder 才会叠加在画面之上。
+
+另有静态方法 `VNAmbientParticles.PlaySparkleBurst(pos, color, count)`：
+在任意世界坐标爆发一簇向四周飞散渐隐的星光，自动销毁，出场演出内部就在调用它。
+
+### 8. `Assets/Scripts/VNEffects/VNEffectsDemo.cs` — 演示驱动
+
+用新版 Input System (`Keyboard.current`) 提供按键交互，另外给背景加了
+**Ken Burns 缓慢缩放**（14 秒 1→1.06 往复）+ 微弱冷色亮度呼吸，让背景也"活着"。
+
+| 按键 | 功能 |
+|---|---|
+| `1`~`5` | 切换并播放五种出场演出 |
+| `Space` | 重播当前预设 |
+| `X` | 溶解退场 |
+| `S` | 手动扫光一次 |
+| `B` | 在立绘位置星光爆发 |
+| `P` | 开/关悬浮粒子 |
+| `H` | 彩虹色相循环演示（再按恢复） |
+
+### 9. `Assets/Scripts/VNEffects/Editor/VNEffectsDemoSetup.cs` — 一键生成演示场景
+
+菜单 **Tools → VN Effects → Create Demo Scene**，全自动完成：
+
+1. 把 `Assets/Assets` 下两张图设置为 Sprite（FullRect 网格——溶解/扫光的 UV 才均匀、关 mipmap、开 alpha 透明），文件名含 "solo" 的当立绘、另一张当背景
+2. 生成材质资产 `Assets/VNEffects/Materials/`（VNImageEffect.mat、VNAdditive.mat）
+3. 生成 `VNEffectsVolumeProfile.asset`：**Bloom**(threshold 1.0 / intensity 1.4 / scatter 0.7) + **Vignette**(0.22)
+4. 新建场景：正交相机（开 HDR 后处理、深色底）+ 全局 Volume
+5. Canvas（**Screen Space - Camera**、1920×1080 缩放）+ 背景图（四边溢出 60px 留 Ken Burns 余量）+ 立绘（挂好 Controller + GlowBackdrop + EntranceAnimator）
+6. 三个悬浮粒子物体（尘埃暖白 / 星光金黄 / 光斑冷蓝，sortingOrder 10~12）
+7. 底部操作提示文字 + 演示驱动物体，**所有引用自动连线**
+8. 保存为 `Assets/Scenes/VNEffectsDemo.unity`
+
+## 五、怎么用（三步）
+
+1. 回到 Unity，等脚本编译完成（无报错）
+2. 菜单 **Tools → VN Effects → Create Demo Scene**
+3. 点 **Play**，按 `1`~`5` / `Space` / `X` / `S` / `B` / `P` / `H` 体验全部效果
+
+### 接入你自己的视觉小说流程
+
+给任何立绘 Image 挂 `VNImageEffectController` + `VNGlowBackdrop` + `VNEntranceAnimator` 三个组件
+（材质留空会自动创建，或指定 `Assets/VNEffects/Materials` 下的资产），然后：
+
+```csharp
+using VNEffects;
+
+// 角色登场
+animator.PlayEntrance(VNEntrancePreset.DissolveGlow)
+        .OnComplete(() => animator.StartIdleEffects());
+
+// 角色说话时高亮
+controller.PulseEmission(new Color(1f, 0.9f, 0.6f), 0.5f);
+
+// 切换到夜晚场景
+backgroundController.DOBrightness(0.55f, 1.5f);
+
+// 角色退场
+animator.PlayExitDissolve();
+```
+
+场景里放几个空物体挂 `VNAmbientParticles`（选 Dust/Sparkles/Orbs 预设）即可获得常驻悬浮粒子。
+
+## 六、设计取舍与注意事项
+
+- **为什么不用 Shader Graph**：uGUI Canvas 渲染不走 URP 光照管线，手写 CG shader 对 UI
+  兼容性最好（Stencil/RectMask2D 全保留），而且噪声在 shader 里直接算，免贴图。
+- **为什么材质要每图实例化**：多个立绘同屏时各自独立控制溶解/发光，互不串扰；代价是打断
+  UI 合批——视觉小说同屏立绘数量少（1~3 张），完全可接受。
+- **构建（Build）注意**：脚本运行时用 `Shader.Find` 作后备，但正式打包请确保场景/材质资产
+  引用了两个 shader（Demo 生成器创建的材质资产已解决此问题），否则 shader 会被裁剪。
+  程序化贴图在运行时生成，不受影响。
+- **`VNGlowBackdrop` 在 Awake 读取图片 rect 尺寸**：立绘用固定 `sizeDelta` 没问题；若你的
+  立绘用拉伸锚点（stretch），布局在 Awake 时可能还没算好，光环尺寸会不对——这种情况请改用
+  固定尺寸锚点。
+- **Bloom 阈值 = 1.0**：普通颜色（≤1）不泛光，只有 HDR 发光（溶解边缘、扫光、粒子、光环、
+  自发光）会亮起来，画面不会整体"糊光"。想更亮调低 threshold 或调高各处 HDR 强度。
+- **性能**：粒子总量 <400、单 Pass UI shader、无 RenderTexture，PC/手机都很轻松。
+
+## 七、本次会话时间线（AI 实际执行步骤）
+
+1. 勘察项目：读 `Packages/manifest.json`、`ProjectVersion.txt`、`ProjectSettings.asset`
+   （确认 URP 17 / Unity 6 / 仅新输入系统 / DOTween 已装 / 两张可用图片）
+2. 制定四层架构计划（shader → 粒子 → 演出编排 → 后处理），确定零美术资源、HDR+Bloom 路线
+3. 编写 `VNImageEffect.shader`（6 合 1 图片特效 shader，含程序化 fbm 噪声、HSV 转换）
+4. 编写 `VNAdditive.shader`（加法混合 HDR 发光 shader）
+5. 编写 `VNProceduralTextures.cs`（柔光圆/四芒星/径向光晕程序化生成）
+6. 编写 `VNImageEffectController.cs`（材质实例管理 + 全部参数 API + 三种常驻循环）
+7. 编写 `VNGlowBackdrop.cs`（背后光环：呼吸脉动 + 出场闪耀）
+8. 编写 `VNEntranceAnimator.cs`（5 种出场 + 2 种退场 + 常驻效果一键开启）
+9. 编写 `VNAmbientParticles.cs`（3 种氛围粒子预设 + 静态星光爆发）
+10. 编写 `VNEffectsDemo.cs`（新输入系统按键演示 + 背景 Ken Burns）
+11. 编写 `Editor/VNEffectsDemoSetup.cs`（一键生成演示场景，自动配置贴图导入/材质/Bloom/连线）
+12. 验证 DOTween API：grep 确认 `Material.DOFloat(int propertyID)` 重载与
+    `CanvasGroup.DOFade`、`RectTransform.DOAnchorPos` 均存在于当前安装版本
+13. 编写本文档 `WhatAiDo.md`
+
+> 注：AI 无法在此环境直接启动 Unity 编译验证。若编译出现报错，把错误信息发回来即可修复。
+
+## 八、版本控制（2026-07-12 建立）
+
+- 项目已上传到公开仓库：**https://github.com/cgenko0729-oss/vnovelProject.git**（默认分支 `main`）
+- 配置了 Unity 专用 `.gitignore`：排除 `Library/`、`Temp/`、`Logs/`、`UserSettings/`、
+  IDE 文件等所有可再生成内容（否则仓库会膨胀几个 GB），以及本地调试截图 `Assets/DebugScreenShot/`
+- **工作流约定（从现在开始严格执行）**：
+  1. 每个新功能都在**新分支**上开发：`git checkout -b feature/<功能名>`
+  2. 完成后提交并推送该分支，再合并回 `main`
+  3. **任何分支都不删除**——每个功能分支都是一个可随时回滚的历史版本点
+
+## 九、第二批功能：氛围特效四件套（2026-07-12，分支 `feature/atmosphere-effects`）
+
+按工作流约定在新分支开发。本批实现四个功能：
+
+### 9.1 God Rays 斜射光束 — `VNGodRays.cs` + 新贴图 `LightBeam`
+
+- `VNProceduralTextures` 新增 `LightBeam` 贴图（128×512：横向柔边 × 纵向上亮下渐隐），
+  同时把内部 `Generate()` 升级为支持任意宽高。
+- `VNGodRays` 挂在 Canvas 下的空 RectTransform 上（渲染顺序在背景之后、立绘之前），
+  Awake 程序化生成 2~4 道光束 RawImage：pivot 设在顶端 → 绕顶端摆动；每道光束的
+  角度/宽度/透明度/摆动周期都带随机偏差，避免整齐划一的机械感。
+- 动态：`DOLocalRotate` 缓慢摆动（yoyo）+ `DOFade` 透明度呼吸，随机相位错开。
+- HDR 颜色（默认暖阳色 ×1.35）配合 Bloom 有柔光感。API：`Show()/Hide()/Toggle()`。
+
+### 9.2 动态暗角/聚焦渐晕 — `VNVignetteFocus.cs`
+
+- 挂在 Global Volume 上，操作 URP Vignette 的 `intensity/smoothness/center` 三个参数。
+- **关键细节**：用 `volume.profile`（运行时实例副本）而非 `sharedProfile`，避免在编辑器里
+  弄脏磁盘上的 Volume Profile 资产；`center.overrideState` 必须手动设 true（资产里没开）。
+- API：`FocusOn(transform)` 把角色世界坐标转视口坐标（`WorldToViewportPoint`）并把暗角
+  中心补间过去、强度加深 → 玩家视线聚焦说话者；`ClearFocus()` 恢复居中基础暗角。
+
+### 9.3 屏幕边缘情绪泛光 — `VNEdgeGlow.cs` + 新贴图 `EdgeGlowFrame`
+
+- 新贴图 `EdgeGlowFrame`（按到边缘的最近距离衰减：边缘亮、中心全透明）。
+- 全屏 RawImage + `VN/Additive` 加法混合 + HDR 颜色 = 屏幕边缘泛光。
+- **嵌套 Canvas + overrideSorting(20)**：保证泛光渲染在氛围粒子（sortingOrder 10~12）之上。
+- 四种情绪预设（各有专属颜色与脉动节奏）：
+  - `HeartBeat` 心动：粉色，"咚-咚——停"的心跳双脉冲序列
+  - `Danger` 危险：红色，0.5s 快速脉动
+  - `Sadness` 悲伤：蓝色，3.8s 缓慢起伏
+  - `Warmth` 温馨：暖橙，5s 极缓呼吸
+- API：`Show(VNEmotionGlow)` / `ShowCustom(颜色,透明度,节奏)` / `Hide()`。
+
+### 9.4 天气系统 — `VNAmbientParticles` 扩展 + `VNWeatherController.cs`
+
+`VNAmbientParticles` 新增四种预设（沿用原架构，全代码配置）：
+
+| 预设 | 实现要点 |
+|---|---|
+| `Petals` 落樱 | 新 `Petal` 椭圆贴图；顶端细带生成；噪声 `separateAxes`（横向强 0.55/纵向弱 0.08）→ 左右摇曳；`rotationOverLifetime` 翻转 |
+| `Rain` 雨 | **拉伸渲染的关键**：Box 形状旋转 90° 朝下 + `startSpeed 10~13` 提供真实粒子速度（Stretch 模式按真实速度拉伸方向才正确），风斜吹用 velocity 模块；自动创建子物体 `RainSplashes` 在屏幕底部持续溅起小水花 |
+| `Snow` 雪 | 慢速下落（16~24s 生命周期跨屏）+ 低频噪声横移 |
+| `Fireflies` 萤火虫 | 只在画面中下部游走；强噪声漫游 + 复用星光的 TwinkleCurve 忽明忽暗；hdrBoost 2.4 让 Bloom 泛光 |
+
+- 新增静态工厂 `VNAmbientParticles.Create(...)`：用"先 SetActive(false) 再挂组件、赋值后
+  再激活"的技巧，保证 Awake→Configure 在字段赋值**之后**执行（修正了直接 AddComponent
+  会用默认字段配置的问题；萤火虫 hdrBoost 也因此改为工厂参数传入）。
+- `VNWeatherController`：惰性创建各天气粒子，切换时旧天气停止发射（已有粒子自然消散）
+  形成交叉过渡；**调色联动**——雨天自动把注册的背景/立绘压暗降饱和（0.8/0.8 冷灰）、
+  雪天清冷透亮、萤火虫之夜整体变暗，用的就是第一批的 `DOBrightness/DOSaturation` API。
+
+### 9.5 演示与场景生成器更新
+
+- `VNEffectsDemo` 新增按键：`G` 光束开关、`V` 聚焦渐晕、`E` 情绪泛光循环、`W` 天气循环；
+  提示文字同步显示当前情绪/天气状态。
+- `VNEffectsDemoSetup` 自动创建并连线：GodRays（背景与立绘之间）、EdgeGlow（Canvas 最后）、
+  VignetteFocus（挂 Volume 上）、WeatherController（moodTargets 自动指向背景+立绘）。
+- **需要重新执行一次 Tools → VN Effects → Create Demo Scene** 让新物体进入场景。
+
+## 十、第三批功能：色调预设 / 情绪动作 / 全屏转场（2026-07-12，分支 `feature/mood-emotes-transitions`）
+
+### 10.1 场景色调预设系统 — `VNMoodGrading.cs`
+
+- **双 Volume 交叉过渡架构**：运行时创建两个全局 Volume（A/B），每个挂
+  ColorAdjustments + WhiteBalance + LiftGammaGain + FilmGrain + Vignette（profile 为运行时
+  实例，不落盘）。切换情绪时把预设写入闲置的 Volume，然后 DOTween 交叉补间两者的 weight
+  —— 画面像电影调色一样平滑过渡，且**任意两种情绪之间都能直接切**（不必先回中性）。
+- **priority 递增技巧**：每次启用的新层 priority +1，保证新层永远叠在正在淡出的旧层之上，
+  交叉期间不打架。
+- 七种预设：`Neutral` 原始 / `Morning` 清晨（冷青偏亮）/ `Sunset` 黄昏（橙金暖高光）/
+  `Night` 夜晚（深蓝低饱和压暗）/ `Memory` 回忆（褪色暖黄 + 胶片颗粒 + 暗角）/
+  `Tension` 紧张（高对比偏绿）/ `Horror` 恐怖（重度去饱和 + 强颗粒 + 深暗角）。
+- 细节：颗粒/暗角组件按预设用 `active` 开关，避免 0 值覆盖基础 Volume 的暗角；
+  Memory/Horror 的暗角会盖过 VNVignetteFocus（优先级更高），属已知取舍。
+- API：`SetMood(VNMood.Sunset, 2f)` 一行切换。
+
+### 10.2 情绪演出动作库 — `VNCharacterEmotes.cs`
+
+一行代码调用的立绘小动作，全部返回 Sequence 可加入剧情编排：
+
+| 方法 | 演出 |
+|---|---|
+| `Surprise()` | 快速上跳 34px + 微放大，OutBounce 落地回弹 |
+| `Angry()` | 横向 DOShakeAnchorPos 快速抖动 + 红色 PulseEmission 发光脉冲 |
+| `Shy()` | 缩小到 0.97 + 下沉 7px + 粉色光晕，停顿后缓慢恢复 |
+| `Dejected()` | 下沉 24px + 亮度 0.72 + 饱和 0.68（**持续状态**，直到 `Recover()`） |
+| `Nod()` | 两次快速下沉回弹（第二次幅度更小，更自然） |
+| `HeadShake()` | ±2.6° 小幅左右旋转摆动后归正 |
+
+- **与悬浮飘动的冲突处理**：动作会移动 anchoredPosition，与常驻悬浮 tween 打架。
+  方案：`Begin()` 时自动 `StopFloating()`（会顺带重置到基准位），动作完成后
+  `ResumeFloating()` 恢复（为此给控制器加了 `IsFloating` 属性和记住上次参数的
+  `ResumeFloating()`）。动作互相打断安全（每次 Begin 杀掉上一个并重置姿态）。
+
+### 10.3 花式全屏转场库 — `VNScreenTransition.shader` + `VNScreenTransition.cs`
+
+- 新 Shader 一个 Pass 内含 6 种图案（`_Mode` 切换）：噪声溶解（复用 fbm，带 HDR 辉光
+  边缘）、百叶窗、瓦片翻转（随机顺序 + 对角线推进，瓦片中心取整保证整块一起翻）、
+  圆形扩散（宽高比校正保证正圆）、水墨晕染（圆扩散 + 强噪声扰动边界）、纯色全覆盖。
+- 组件流程：`Play(type, onCovered)` → 覆盖率 0→1（转出）→ 回调里切换背景/场景内容 →
+  1→0（转入）。嵌套 Canvas 排序 100 盖住一切，转场期间 RawImage 拦截点击。
+- 七种转场（每种有推荐时长）：`NoiseDissolve` / `Blinds` / `Tiles` / `CircleWipe`（配
+  `PlayFrom(type, 角色)` 从说话者位置扩散）/ `InkSpread` / `WhiteFlash`（HDR 白 ×2.2 配
+  Bloom 爆亮一瞬间，0.22s 快出 0.75s 慢收）/ `BokehOrbs`（大光斑粒子涌满屏幕 + 柔暖光罩，
+  进入回忆专用，复用 Orbs 预设 rate×14）。
+
+### 10.4 演示与场景生成器更新
+
+- 新按键：`M` 色调循环、`T` 转场循环（每次转场自动换一张背景图，正好演示"同一立绘
+  不同背景不同情绪"）、`6` 惊讶、`7` 生气、`8` 害羞、`9` 沮丧/恢复、`0` 点头、`N` 摇头。
+- 场景生成器：新增 VNScreenTransition.mat 材质资产、MoodGrading/ScreenTransition 物体、
+  立绘自动挂 VNCharacterEmotes；把 Assets/Assets 里除立绘外的所有图收集为转场轮换背景。
+- **需要重新执行 Tools → VN Effects → Create Demo Scene**。
+
+## 十一、第四批功能：呼吸立绘 / 轮廓光 / 鼠标星尘 / 热浪（2026-07-12，分支 `feature/breathing-rim-stardust-haze`）
+
+### 11.1 呼吸感立绘（Pseudo-Live2D）— 控制器新增 `StartBreathingMotion()`
+
+- 三个正弦叠加让立绘"活着"：已有的**上下悬浮** + 新增的**横向缩放呼吸**
+  （X 轴 ±1.3% 模拟胸腔起伏，Y 轴带 40% 同步微伸展）+ **极缓倾斜摆动**
+  （±0.7°，周期 7s，先缓慢摆到一侧再往复，起步不跳变）。
+- `StartIdleEffects()` 已自动包含，出场后立绘自动开始呼吸，零调用成本。
+- 与情绪动作库联动：动作 `Begin()` 时自动暂停呼吸（重置缩放/旋转），
+  结束后 `ResumeBreathingMotion()` 恢复（控制器记住上次参数）。
+
+### 11.2 立绘轮廓光（Rim Light）— Shader 升级 + 控制器 API
+
+- `VNImageEffect.shader` 新增：朝光源方向（`_RimAngle`）偏移采样两次 alpha
+  （1×和 2× `_RimWidth`），偏移处透明说明该像素位于受光一侧的外缘 →
+  叠加 HDR `_RimColor` 描边。配合 Bloom 形成发光轮廓。
+- API：`SetRimLight(颜色, 强度, 宽度, 光源角度)` / `DORimAmount()` 渐亮渐灭 /
+  `ClearRimLight()`。夕阳场景橙色轮廓光（角度 40°）、月夜蓝色（140°），
+  立绘与背景光照氛围立刻统一。
+- 注意：采样邻域 alpha 依赖 Clamp 寻址 + FullRect 单图（本项目均满足）；
+  若日后使用 SpriteAtlas 图集需关闭该效果（邻域会采到别的图）。
+
+### 11.3 鼠标轨迹星尘 — `VNMouseStardust.cs`
+
+- 按**移动距离**手动 `Emit()`（每单位距离 7 颗，带余数累加器保证低速也均匀），
+  单帧上限 30 颗防止瞬移狂喷；世界空间模拟让星尘留在原地形成拖尾。
+- 星尘用四芒星贴图 + HDR×2 泛光，轻微下坠 + 随机漂移 + 缩小消隐 + 缓慢旋转。
+- `Toggle()` / `enabled` 开关；用新版 Input System 的 `Mouse.current` 读鼠标。
+
+### 11.4 热浪/空气扭曲 — `VNHeatHaze.cs` + 新粒子预设 `Mist`
+
+- 复用 shader 已有的 `_WaveAmount` 波浪扭曲：开启时把目标图片（默认只有背景，
+  避免立绘脸部扭曲）的波浪调到 0.006/速度 3.5/频率 24 → 热浪升腾的空气感。
+- 配套新 `Mist` 雾气粒子预设：1.2~2.6 世界单位的大团柔雾（透明度仅 4%~10%）
+  从画面下方缓缓升起 + 低频噪声翻滚。温泉/夏日柏油路/篝火场景一键成套。
+
+### 11.5 演示与场景生成器更新
+
+- 新按键：`R` 轮廓光循环（关→夕阳橙→月夜蓝）、`Z` 热浪+蒸汽开关、`C` 鼠标星尘开关；
+  呼吸感立绘无需按键，出场后自动生效。
+- 生成器新增 MouseStardust、HeatHaze 物体并连线。
+- **需要重新执行 Tools → VN Effects → Create Demo Scene**。
+
+## 十二、第五批功能：说话者高亮 / 水面波光 / 屏幕震动 / 对话框（2026-07-12，分支 `feature/speaker-highlight`）
+
+> 注：用户同时点了"呼吸感立绘"，该功能已在第四批实现并自动运行，本批未重复开发。
+
+### 12.1 说话者高亮系统 — `VNSpeakerHighlight.cs` + 控制器"缩放倍率"改造
+
+- **关键改造**：高亮要缩放立绘，但呼吸动作也在补间缩放，会打架。给控制器引入
+  `_scaleMultiplier` 概念：`CurrentBaseScale = 初始缩放 × 倍率`；呼吸围绕它进行；
+  `DOScaleMultiplier(mult, dur)` 切倍率时先暂停呼吸缩放分量、过渡完成后围绕新基准继续呼吸。
+  情绪动作库改为从控制器读 `CurrentBaseScale`（不再自己缓存缩放），出场动画重播前
+  `ResetScaleMultiplier()`。
+- 管理器：`SetSpeaker(fx)` —— 说话者恢复亮度 + 放大 1.03 + 在立绘之间移到最前 +
+  光环 Flare 闪耀；旁听者压暗 0.6 + 降饱和 0.85 + 微缩 0.97 + 光环熄灭。`ClearSpeaker()` 全员复原。
+- 场景生成器升级为**双角色**：有两张 "solo" 图时创建 Character/CharacterB（±380 对位），
+  才能看出多人对话的层次。
+
+### 12.2 水面波光 — Shader 新开关 + 控制器 API
+
+- `VNImageEffect.shader` 新增 Water Shimmer 块：**两层不同速度/频率的正弦波相乘**
+  （w1 带 y 向扰动、w2 反向滚动）→ pow(3) 锐化成粼粼高光点，再乘一层滚动值噪声打散
+  规律感；`smoothstep` 限制在画面下部 `_ShimmerHeight` 以内并向上渐隐。HDR 颜色配 Bloom。
+- API：`SetWaterShimmer(强度, 颜色, 高度, 密度, 速度)` / `DOShimmerAmount()` 渐现渐隐。
+
+### 12.3 分级屏幕震动 — `VNScreenShake.cs` + SceneRoot 容器
+
+- **架构点**：Canvas 是 Screen Space - Camera，震相机 UI 纹丝不动。因此生成器新增
+  `SceneRoot` 容器（背景+光束+立绘都挂进去），震动作用于容器 —— 画面震、对话框稳，
+  正是电影感的做法。悬浮/呼吸等 tween 在容器的子物体上，互不冲突。
+- 三级预设：Light 6px/0.25s（心跳）、Medium 16px/0.4s（惊吓）、
+  Heavy 34px/0.6s + ±1.4° 旋转抖动（爆炸）。每次震动前重置基准位，连续触发不漂移。
+
+### 12.4 对话框高级化 — `VNDialogueBox.cs` + `VNTypewriterText.cs` + 程序化圆角贴图
+
+- `VNProceduralTextures` 新增 SDF 圆角矩形（实心面板）与 3px 描边框两张 9-slice Sprite。
+- **边缘流光**：描边框 Image 挂 `VNImageEffectController` 开扫光循环 —— 扫光带只点亮
+  边框像素，视觉上就是一条流光沿边框掠过（复用现有 shader，零新代码）。
+- **打字机文字**：`VNTypewriterText : BaseMeshEffect` 直接改 uGUI Text 网格顶点，
+  每字一个四边形，按显现进度做"上浮 10px + 淡入"（OutQuad）。**特意不用 TMP**：
+  legacy Text 走系统字体回退，中文台词开箱即用（TMP 默认字体无 CJK 字形会显示方块）。
+- 对话框：半透明磨砂圆角面板 + 底部 OutBack 轻弹入场 + 骑在顶边的名牌 + 右下角 "▼"
+  呼吸浮动继续箭头。API：`Say(名字, 内容)` / `CompleteTyping()` 催促 / `HideBox()`。
+- 演示的 Enter 键对话流程**联动说话者高亮**：谁说话谁亮，旁听者自动压暗。
+
+### 12.5 演示新按键
+
+`Y` 说话者循环（A→B→无）、`U` 水面波光开关、`J/K/L` 轻/中/强震动、
+`Enter` 对话演示（打字中再按 = 催促显示全文）。
+**需要重新执行 Tools → VN Effects → Create Demo Scene**。
+
+## 十三、第六批功能：视差 / 点击涟漪 / 眨眼转场 / 荷兰角（2026-07-12，分支 `feature/parallax-ripple-eyelid-dutch`）
+
+> 附带决定：上一批误入库的图片已从当前版本移除（`d335f7e`），用户选择**不重写历史**，保持现状。
+
+### 13.1 画面容器层级重构
+
+```
+Canvas
+└─ SceneRoot   ← 屏幕震动作用于此
+   └─ TiltRoot ← 荷兰角旋转+防露角放大作用于此
+      ├─ LayerBack  (背景)        ← 视差强度 8px
+      ├─ LayerMid   (God Rays)    ← 视差强度 13px
+      └─ LayerFront (立绘×2+光环) ← 视差强度 19px
+```
+三种"整屏运动"（震动/倾斜/视差）各占一层容器，与立绘自身的悬浮/呼吸/情绪
+动作（作用于立绘 RectTransform）完全解耦，任意叠加不打架。
+
+### 13.2 多层视差（`VNParallax.cs`）
+
+- 读鼠标位置归一化到 -1..1，各层 `anchoredPosition = 基准 - 偏移 × 强度`（反向移动），
+  越"近"的层强度越大 → 纵深感。指数平滑（帧率无关）让跟随有"重量感"。
+- 支持运行时 `AddLayer()`（将来加前景树叶/窗框装饰直接注册）。`Toggle()` 关闭时平滑回中。
+- 背景本来就四边溢出 60px（Ken Burns 余量），视差 ±8px 不会露边。
+
+### 13.3 点击涟漪（`VNClickRipple.cs`）+ 新贴图 `Ring`
+
+- 新程序化贴图：柔边圆环。点击时发射**单颗粒子**：尺寸曲线 0.12→1 快速扩散、
+  透明度 0.9→0 衰减 —— 一颗粒子就是一圈涟漪；同时 `PlaySparkleBurst` 3 颗星光。
+- HDR×1.8 配 Bloom 微微发光。世界空间模拟，涟漪留在点击处。
+
+### 13.4 POV 眨眼转场 — `VNScreenTransition` 新 Mode 6
+
+- Shader：上下两片"眼睑"随 Progress 合拢，边缘用 `sin(uv.x·π)` 加眼睑弧线
+  （中间闭合更快，更像真实眼皮）；合拢用 InQuad 加速、睁开较慢（0.4s/0.65s）。
+- 醒来/昏迷/回忆开场的第一人称感。已自动进入 T 键转场轮换，另有 F 键直接触发。
+
+### 13.5 荷兰角（`VNDutchAngle.cs`）
+
+- `SetTilt(3°)` 缓慢倾斜 TiltRoot；**防露角**：按公式 `cosθ + aspect·sinθ` 自动放大
+  （3° ≈ ×1.09），旋转后四角不露底。`Clear()` 回正、`Toggle()` 开关。
+- 紧张/异常/醉酒场景的经典心理暗示手法。
+
+### 13.6 演示新按键
+
+`O` 视差开关（默认开，晃鼠标看纵深）、`I` 荷兰角开关、`F` 眨眼转场（换背景）、
+鼠标左键点击任意处 = 涟漪+星光。
+**需要重新执行 Tools → VN Effects → Create Demo Scene**。
+
+## 十四、第七批功能：镜头语言 / 心跳演出 / 樱吹雪（2026-07-12，分支 `feature/camera-heartbeat-sakura`）
+
+### 14.1 容器层级再加一层
+
+```
+SceneRoot(震动·位置 + 心跳·缩放)
+└─ ZoomRoot(镜头缩放/平移)      ← 新增
+   └─ TiltRoot(荷兰角·旋转)
+      └─ LayerBack/Mid/Front(视差)
+```
+每种整屏运动独占一个变换维度/容器：震动动 SceneRoot 位置、心跳脉动 SceneRoot 缩放、
+运镜动 ZoomRoot、荷兰角动 TiltRoot、视差动三个 Layer —— 全部可同时叠加。
+
+### 14.2 镜头运动语言库 — `VNCamera.cs`
+
+| 方法 | 电影语言 | 实现 |
+|---|---|---|
+| `PushIn(1.06, 5s, 焦点)` | 缓推：重要台词的压迫感 | ZoomRoot 缓慢放大 + 焦点补偿平移 |
+| `SnapZoom(1.12, 0.16s, 焦点, 震动器)` | 急推：惊愕瞬间 | 快速放大，到位瞬间联动轻震 |
+| `Pan(目标点, 0.6)` | 平移：视线引导 | 向目标点反向平移（centering 可调居中程度） |
+| `DollyZoom(1.3, 3s)` | 眩晕镜头：名场面 | 背景放大 + 立绘 `DOScaleMultiplier(1/zoom)` 反向补偿保持大小 → 空间被拉扯 |
+| `ResetCamera()` | 复位 | 缩放/平移/立绘补偿全还原 |
+
+- **焦点补偿**：绕中心放大后平移 `-焦点×(zoom-1)`，让焦点保持在原屏幕位置 →
+  视觉上"镜头推向那个点"。立绘的 anchoredPosition 可直接当焦点用。
+- DollyZoom 的立绘补偿复用了说话者高亮的缩放倍率机制，与呼吸动作依然兼容。
+  已知取舍：DollyZoom/Reset 会覆盖说话者高亮的缩放倍率。
+
+### 14.3 心跳演出 — `VNHeartbeat.cs`
+
+- SceneRoot 缩放按"咚-咚——停"节奏脉动（1.4% 幅度，节奏与 VNEdgeGlow 的
+  HeartBeat 泛光图案完全一致：0.1/0.16/0.1/0.42+0.38s），并自动开启粉色边缘泛光。
+- `StartBeat()/StopBeat()/Toggle()`。告白、紧张、暧昧场景一行开启。
+
+### 14.4 樱吹雪爆发 — `VNSakuraBurst.cs`
+
+- 纯组合技：创建一个 **10 倍速率**的花瓣系统并调成"暴风参数"（生命周期缩短到 4~7s、
+  强风向左 -3.2~-1.6、生成带右移加宽保证覆盖全屏）→ 花瓣被风横扫涌过画面 3 秒，
+  同时自动开启心跳演出、延后 2 秒关闭；爆发结束后余瓣自然飘落殆尽。
+- `sakura.Play()` 一行触发告白名场面。
+
+### 14.5 演示新按键
+
+`Q` 运镜循环（缓推→急推→平移→眩晕→复位，提示栏显示当前运镜名）、
+`A` 心跳演出开关、`D` 樱吹雪告白。
+推荐组合：D 樱吹雪 + Q 缓推 + M 黄昏色调 = 完整告白演出。
+**需要重新执行 Tools → VN Effects → Create Demo Scene**。
+
+## 十五、第八批功能：景深/色调匹配/脚影/残影/云影/选项（2026-07-13，分支 `feature/depth-polish-choices`）
+
+### 15.1 伪景深 — Shader 微模糊 + `VNFakeDoF.cs`
+
+- **技术修正**：原计划用 URP 真 DoF，但 Canvas UI **不写深度缓冲**，真 DoF 会把立绘和
+  背景一起糊掉。改为给 `VNImageEffect` shader 加 **9-tap 微模糊**（`_BlurAmount`，
+  中心+四方+四角采样平均），只作用于背景那张图 —— 效果反而更准确。
+- `VNFakeDoF.SetFocus(true)` 四合一：背景模糊 0.006 + 压暗 0.86 + 降饱和 0.9 +
+  背景层微放大 1.035（缩放 LayerBack 而不是背景图，避开 Ken Burns 的缩放动画）。
+  立绘瞬间"浮"出来。控制器新增 `SetBlur/DOBlur` API。
+
+### 15.2 立绘色调自动匹配背景 — `VNToneMatch.cs`
+
+- **GPU 均值采样**：`Graphics.Blit` 把背景图缩到 4×4 RenderTexture 再 `ReadPixels`
+  回读求平均（不要求贴图开 Read/Write）。
+- 平均色**归一化**（最大分量拉到 1）后只取"色调"，与白色按 `strength`(9%) 插值，
+  通过 `Image.color` 乘法微染色 —— 不占用特效 shader 的任何参数，不改变立绘亮度。
+- 换背景（T/F 转场）时自动匹配，开场也匹配初始背景。消除"立绘像贴纸"的违和感。
+
+### 15.3 立绘脚下阴影 — `VNFootShadow.cs`
+
+- 角色脚下自动生成扁椭圆软影（SoftCircle 压扁 + 黑色半透明），挂组件即用零配置。
+- 每帧联动：悬浮越高影子越小越淡（离地感）、跟随角色横移、
+  透明度同步 CanvasGroup 淡入淡出与溶解出场进度。已加入 CreateCharacter 自动挂载。
+
+### 15.4 残影冲入出场 — 出场预设新增 `AfterimageDash`
+
+- 角色从画面左侧 560px 外高速冲入（0.38s OutCubic），途中三次在当前位置生成
+  **冷色调残影副本**（复制 Image，alpha 0.42，0.3s 淡出后销毁），
+  收尾微闪白 + 光环闪耀 + 星光。惊喜/战斗系登场。
+
+### 15.5 云影飘过 — `VNCloudShadows.cs`
+
+- 3 块 950~1500px 的黑色软斑（普通透明混合 = 压暗）以不同速度缓慢横穿背景上部，
+  越界回绕 + 轻微正弦纵向漂移。只挂在 LayerBack 下，**不会盖到立绘**。晴天的"活气"。
+
+### 15.6 选项按钮演出 — `VNChoicePanel.cs`（零新特效，纯组合）
+
+- `Show(选项数组, 回调)` 运行时构建按钮（圆角面板贴图复用对话框的）：
+  - **错落飞入**：右侧 90px 滑入 + 淡入，每个延迟 0.09s
+  - **悬停**：`PlayShine` 扫光掠过 + 微放大 1.045（VNImageEffectController 直接挂按钮）
+  - **选中**：被选项闪光 + 扫光 + OutBack 轻弹；**落选项噪声溶解消散**
+- 场景生成器自动创建 **EventSystem + InputSystemUIInputModule**（新输入系统的
+  UI 点击必需，此前场景没有交互 UI 所以一直没建）。
+
+### 15.7 演示新按键
+
+`[` 伪景深开关、`]` 云影开关、`Tab` 残影冲入、`退格` 选项演出；
+色调匹配与脚下阴影全自动无按键。
+推荐组合：`[` 伪景深 + `V` 聚焦渐晕 + `Q` 缓推 = 完整对话特写运镜。
+**需要重新执行 Tools → VN Effects → Create Demo Scene**。
+
+## 十六、问题修复记录
+
+### 修复 1：`Particle Velocity curves must all be in the same mode`（2026-07-12）
+
+**现象**：运行时报错。
+**原因**：`VNAmbientParticles.cs` 的 velocityOverLifetime 模块中，X/Y 轴用了
+`MinMaxCurve(min, max)`（双常数随机区间模式），Z 轴却写成 `vel.z = 0f`
+（隐式转换为单常数模式）。Unity 要求同一速度模块的三条曲线**模式必须一致**。
+**修复**：三个粒子预设（Dust / Sparkles / Orbs）的 Z 轴统一改为
+`new ParticleSystem.MinMaxCurve(0f, 0f)`，与 X/Y 保持双常数模式。
