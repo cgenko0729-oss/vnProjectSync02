@@ -17,6 +17,9 @@
 10. 用户随后明确说明：已联系插件作者并取得公开发布授权，要求忽略此前的许可证风险提示并继续上传。因此按用户确认，将完整项目发布到 Public 仓库；此授权确认作为本次发布决策依据记录在此。
 11. 使用系统 Git 初始化本地仓库，初始分支为 `main`；添加远端 `origin=https://github.com/cgenko0729-oss/vnProjectSync02.git`。Git 提交身份为 `Genko1204019 <cgenko0729@gmail.com>`。
 12. 首次暂存共 3,601 个文件；`Library/`、`Temp/`、`Logs/`、`obj/`、`UserSettings/`、`Assets/DebugScreenShot/`、生成的 `.csproj` 与 `.sln` 均保持忽略，没有加入版本控制。
+13. 公开仓库敏感信息检查未发现私钥文件、常见 GitHub/API 令牌格式或敏感凭据文件；Git 对象总量约 42.97 MiB，无需 Git LFS。
+14. 创建首次提交 `7138f6d`（`Initialize Unity visual novel project`），包含 3,601 个文件；创建注释标签 `baseline-before-vn-system`。
+15. 使用普通、非强制推送成功发布 `main` 分支和 `baseline-before-vn-system` 标签；本地 `main` 已设置跟踪 `origin/main`。整个过程没有删除分支、没有强推、没有改写提交历史。
 
 ### GitHub 上传阻塞与下一步
 
