@@ -271,3 +271,5 @@ VNRoot
 验证结果：项目当时已在两个 Unity Editor 进程中打开，Unity BatchMode 因工程锁无法启动，未擅自关闭用户编辑器。改用 `Temp/CodexValidation` 中不进入版本控制的一次性项目，分别按 Unity 程序集边界编译运行时和 Editor 代码；两者最终均为 **0 warnings / 0 errors**。同时修正 Unity 6 已弃用的 `FindObjectOfType`、命令生成器区域小数格式，以及角色入场同帧查找问题。
 
 当前边界：系统代码与默认配置已完成，但没有擅自修改用户正在编辑的场景，也没有虚构角色/背景资源映射或剧情。下一步在 Unity 中执行 `Tools > VN System > Create or Repair Runtime Rig`，为 Catalog 指定真实 Sprite，并制作最小纵向切片 Conversation。
+
+版本控制结果：实现提交为 `1c2345d`（`Add VN authoring foundation`），已普通推送到新分支 `agent/vn-foundation` 并设置跟踪 `origin/agent/vn-foundation`。远端 `main` 仍保持在 `a323ac1`，基线标签未移动；没有删除、强推或改写任何分支。
